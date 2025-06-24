@@ -9,6 +9,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from moviepy.editor import *
 from datetime import datetime
 import dotenv
@@ -18,19 +19,39 @@ from googleapiclient.http import MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 import pickle
+import glob
+import logging
 
+# Load environment variables
 dotenv.load_dotenv()
 my_client_id = os.getenv("YOUR_CLIENT_ID")
 my_client_secret = os.getenv("YOUR_CLIENT_SECRET")
 
 class RedditVideoGenerator:
-    def __init__(self):
-        self.reddit = praw.Reddit(
-            client_id=my_client_id,
-            client_secret=my_client_secret,
-            user_agent="RedditVideoBot/1.0"
-        )
+    TOP_STORY_SUBREDDITS = [
+        "AskReddit", "tifu", "relationships", "nosleep", "confession"
+    ]
+
+    def __init__(self, auto_upload=False):
+        # Initialize Reddit API with better error handling
+        if not my_client_id or not my_client_secret:
+            raise ValueError("Reddit API credentials not found. Please check your .env file.")
         
+        try:
+            self.reddit = praw.Reddit(
+                client_id=my_client_id.strip(),
+                client_secret=my_client_secret.strip(),
+                user_agent="script:RedditVideoBot:v1.0 (by /u/beast-fx2556)"
+            )
+            # Test the connection
+            self.reddit.user.me()
+            print("✅ Successfully authenticated with Reddit API")
+        except Exception as e:
+            print(f"❌ Failed to initialize Reddit API: {e}")
+            print("Please verify your credentials in .env file and Reddit app settings")
+            raise
+        
+        # Create directories
         self.audio_dir = "audio"
         self.screenshots_dir = "screenshots"
         self.videos_dir = "videos"
@@ -39,53 +60,93 @@ class RedditVideoGenerator:
         for directory in [self.audio_dir, self.screenshots_dir, self.videos_dir, self.background_dir]:
             os.makedirs(directory, exist_ok=True)
         
+        # Load processed posts
         self.processed_posts_file = "processed_posts.json"
         self.processed_posts = self.load_processed_posts()
         
+        # YouTube API settings
         self.SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
         self.API_SERVICE_NAME = 'youtube'
         self.API_VERSION = 'v3'
         self.CLIENT_SECRETS_FILE = 'client_secret.json'
         self.youtube = None
+        self.auto_upload = auto_upload
+        logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
     
     def load_processed_posts(self):
+        """Load processed posts from JSON file, handling empty or corrupted files"""
         try:
-            with open(self.processed_posts_file, 'r') as f:
-                return set(json.load(f))
-        except FileNotFoundError:
+            if os.path.exists(self.processed_posts_file):
+                with open(self.processed_posts_file, 'r') as f:
+                    content = f.read().strip()
+                    if content:  # Check if file is not empty
+                        return set(json.loads(content))
+                    else:
+                        print("Warning: processed_posts.json is empty. Creating new set.")
+                        return set()
+            else:
+                print("processed_posts.json not found. Creating new set.")
+                return set()
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            print(f"Error loading processed posts: {e}. Creating new set.")
             return set()
     
     def save_processed_posts(self):
-        with open(self.processed_posts_file, 'w') as f:
-            json.dump(list(self.processed_posts), f)
+        """Save processed posts to JSON file"""
+        try:
+            with open(self.processed_posts_file, 'w') as f:
+                json.dump(list(self.processed_posts), f, indent=2)
+        except Exception as e:
+            print(f"Error saving processed posts: {e}")
     
     def authenticate_youtube(self):
+        """Authenticate with YouTube API"""
         credentials = None
         
+        # Load existing credentials
         if os.path.exists('token.pickle'):
-            with open('token.pickle', 'rb') as token:
-                credentials = pickle.load(token)
+            try:
+                with open('token.pickle', 'rb') as token:
+                    credentials = pickle.load(token)
+            except Exception as e:
+                print(f"Error loading credentials: {e}")
         
+        # Refresh or get new credentials
         if not credentials or not credentials.valid:
             if credentials and credentials.expired and credentials.refresh_token:
-                credentials.refresh(Request())
-            else:
+                try:
+                    credentials.refresh(Request())
+                except Exception as e:
+                    print(f"Error refreshing credentials: {e}")
+                    credentials = None
+            
+            if not credentials:
+                if not os.path.exists(self.CLIENT_SECRETS_FILE):
+                    raise FileNotFoundError(f"YouTube client secrets file '{self.CLIENT_SECRETS_FILE}' not found.")
+                
                 flow = InstalledAppFlow.from_client_secrets_file(
                     self.CLIENT_SECRETS_FILE, self.SCOPES)
                 credentials = flow.run_local_server(port=0)
             
-            with open('token.pickle', 'wb') as token:
-                pickle.dump(credentials, token)
+            # Save credentials
+            try:
+                with open('token.pickle', 'wb') as token:
+                    pickle.dump(credentials, token)
+            except Exception as e:
+                print(f"Error saving credentials: {e}")
         
         self.youtube = build(self.API_SERVICE_NAME, self.API_VERSION, credentials=credentials)
         return self.youtube
     
     def generate_video_metadata(self, post_data, comments_data):
-        title = f"Reddit Story: {post_data['title'][:60]}..."
+        """Generate YouTube video metadata"""
+        subreddit = post_data.get('subreddit', 'AskReddit')
+        title = f"Reddit Story from r/{subreddit}: {post_data['title'][:60]}..."
         if len(post_data['title']) <= 60:
-            title = f"Reddit Story: {post_data['title']}"
+            title = f"Reddit Story from r/{subreddit}: {post_data['title']}"
         
-        description = f"""🔥 Reddit Story from r/AskReddit 🔥
+        # Create description
+        description = f"""🔥 Reddit Story from r/{subreddit} 🔥
 
 Original Post: {post_data['title']}
 
@@ -102,11 +163,11 @@ Original Post: {post_data['title']}
 🎯 Don't forget to LIKE and SUBSCRIBE for more Reddit stories!
 💬 Share your thoughts in the comments below!
 
-#Reddit #AskReddit #RedditStories #Stories #Entertainment
+#Reddit #{subreddit} #RedditStories #Stories #Entertainment
 """
         
         tags = [
-            "reddit", "askreddit", "reddit stories", "stories", "entertainment",
+            "reddit", subreddit.lower(), "reddit stories", "stories", "entertainment",
             "reddit compilation", "reddit posts", "reddit comments", "viral",
             "funny", "interesting", "discussion", "community", "social media"
         ]
@@ -114,10 +175,15 @@ Original Post: {post_data['title']}
         return title, description, tags
     
     def upload_to_youtube(self, video_path, post_data, comments_data):
+        """Upload video to YouTube"""
         print("Uploading video to YouTube...")
         
         if not self.youtube:
-            self.authenticate_youtube()
+            try:
+                self.authenticate_youtube()
+            except Exception as e:
+                print(f"YouTube authentication failed: {e}")
+                return None
         
         title, description, tags = self.generate_video_metadata(post_data, comments_data)
         
@@ -126,7 +192,7 @@ Original Post: {post_data['title']}
                 'title': title,
                 'description': description,
                 'tags': tags,
-                'categoryId': '24',
+                'categoryId': '24',  # Entertainment
                 'defaultLanguage': 'en',
                 'defaultAudioLanguage': 'en'
             },
@@ -136,9 +202,9 @@ Original Post: {post_data['title']}
             }
         }
         
-        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype='video/*')
-        
         try:
+            media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype='video/*')
+            
             insert_request = self.youtube.videos().insert(
                 part=','.join(body.keys()),
                 body=body,
@@ -164,7 +230,8 @@ Original Post: {post_data['title']}
                             return None
                         time.sleep(2 ** retry)
                     else:
-                        raise
+                        print(f"HTTP Error: {e}")
+                        return None
                 except Exception as e:
                     print(f"Upload error: {e}")
                     return None
@@ -188,19 +255,16 @@ Original Post: {post_data['title']}
                     print(f"Upload failed: {response}")
                     return None
         
-        except HttpError as e:
-            print(f"HTTP Error during upload: {e}")
-            return None
         except Exception as e:
             print(f"Unexpected error during upload: {e}")
             return None
     
     def add_thumbnail_if_available(self, video_id):
+        """Add thumbnail to YouTube video if available"""
         thumbnail_path = os.path.join(self.screenshots_dir, "post_*.png")
-        import glob
         thumbnails = glob.glob(thumbnail_path)
         
-        if thumbnails:
+        if thumbnails and self.youtube:
             try:
                 self.youtube.thumbnails().set(
                     videoId=video_id,
@@ -210,119 +274,212 @@ Original Post: {post_data['title']}
             except Exception as e:
                 print(f"Failed to upload thumbnail: {e}")
     
-    def get_reddit_post(self, subreddit_name="AskReddit", limit=10):
+    def get_reddit_post(self, subreddit_name=None, limit=10):
+        """Get a suitable Reddit post"""
+        if subreddit_name is None:
+            subreddit_name = random.choice(self.TOP_STORY_SUBREDDITS)
         print(f"Fetching posts from r/{subreddit_name}...")
         
-        subreddit = self.reddit.subreddit(subreddit_name)
-        
-        for submission in subreddit.hot(limit=limit):
-            if submission.id in self.processed_posts:
-                continue
+        try:
+            subreddit = self.reddit.subreddit(subreddit_name)
             
-            if submission.over_18:
-                continue
+            for submission in subreddit.hot(limit=limit):
+                if submission.id in self.processed_posts:
+                    continue
+                
+                if submission.over_18:
+                    continue
+                
+                if not submission.selftext and not submission.title:
+                    continue
+                
+                # Skip posts that are too short
+                if len(submission.title) < 10:
+                    continue
+                
+                print(f"Selected post: {submission.title[:50]}...")
+                submission.subreddit_name = subreddit_name
+                return submission
             
-            if not submission.selftext and not submission.title:
-                continue
+            print("No suitable posts found!")
+            return None
             
-            print(f"Selected post: {submission.title[:50]}...")
-            return submission
-        
-        print("No suitable posts found!")
-        return None
+        except Exception as e:
+            print(f"Error fetching Reddit posts: {e}")
+            return None
     
     def get_comments(self, submission, max_comments=5, max_words=100):
+        """Get suitable comments from a Reddit post"""
         print("Fetching comments...")
         
-        submission.comments.replace_more(limit=0)
-        
-        selected_comments = []
-        
-        for comment in submission.comments:
-            if not hasattr(comment, 'body') or comment.body in ['[deleted]', '[removed]']:
-                continue
+        try:
+            submission.comments.replace_more(limit=0)
             
-            if len(comment.body.split()) > max_words:
-                continue
+            selected_comments = []
             
-            if len(comment.body.split()) < 5:
-                continue
+            for comment in submission.comments:
+                if not hasattr(comment, 'body') or comment.body in ['[deleted]', '[removed]']:
+                    continue
+                
+                word_count = len(comment.body.split())
+                if word_count > max_words or word_count < 5:
+                    continue
+                
+                selected_comments.append({
+                    'id': comment.id,
+                    'body': comment.body,
+                    'score': comment.score
+                })
+                
+                if len(selected_comments) >= max_comments:
+                    break
             
-            selected_comments.append({
-                'id': comment.id,
-                'body': comment.body,
-                'score': comment.score
-            })
+            # Sort by score (upvotes)
+            selected_comments.sort(key=lambda x: x['score'], reverse=True)
+            print(f"Selected {len(selected_comments)} comments")
             
-            if len(selected_comments) >= max_comments:
-                break
-        
-        selected_comments.sort(key=lambda x: x['score'], reverse=True)
-        print(f"Selected {len(selected_comments)} comments")
-        
-        return selected_comments
+            return selected_comments
+            
+        except Exception as e:
+            print(f"Error fetching comments: {e}")
+            return []
     
     def text_to_speech(self, text, filename):
+        """Convert text to speech"""
         print(f"Generating TTS for: {filename}")
         
-        engine = pyttsx3.init()
-        
-        engine.setProperty('rate', 150)
-        engine.setProperty('volume', 0.9)
-        
-        voices = engine.getProperty('voices')
-        if voices:
-            engine.setProperty('voice', voices[0].id)
-        
-        filepath = os.path.join(self.audio_dir, f"{filename}.wav")
-        engine.save_to_file(text, filepath)
-        engine.runAndWait()
-        
-        return filepath
+        try:
+            engine = pyttsx3.init()
+            
+            # Configure TTS settings
+            engine.setProperty('rate', 165)
+            engine.setProperty('volume', 1.0)
+            
+            voices = engine.getProperty('voices')
+            # Prefer female/en voices, else randomize
+            preferred_voices = [v for v in voices if ('en' in v.languages[0] if hasattr(v, 'languages') and v.languages else 'en' in v.id) and ('female' in v.name.lower() or 'zira' in v.id.lower() or 'susan' in v.id.lower())]
+            if not preferred_voices:
+                preferred_voices = [v for v in voices if 'en' in (v.languages[0] if hasattr(v, 'languages') and v.languages else v.id)]
+            if preferred_voices:
+                chosen_voice = random.choice(preferred_voices)
+                engine.setProperty('voice', chosen_voice.id)
+            elif voices:
+                engine.setProperty('voice', random.choice(voices).id)
+            
+            filepath = os.path.join(self.audio_dir, f"{filename}.wav")
+            engine.save_to_file(text, filepath)
+            engine.runAndWait()
+            
+            # Verify file was created
+            if os.path.exists(filepath):
+                return filepath
+            else:
+                print(f"Error: Audio file not created for {filename}")
+                return None
+                
+        except Exception as e:
+            print(f"Error generating TTS for {filename}: {e}")
+            return None
     
     def setup_browser(self):
+        """Setup Firefox browser with options"""
         print("Setting up browser...")
         
-        options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--width=1920")
-        options.add_argument("--height=1080")
-        
-        driver = webdriver.Firefox(options=options)
-        return driver
+        try:
+            options = Options()
+            options.add_argument("--headless")
+            options.add_argument("--width=1920")
+            options.add_argument("--height=1080")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            
+            driver = webdriver.Firefox(options=options)
+            return driver
+            
+        except Exception as e:
+            print(f"Error setting up browser: {e}")
+            raise
     
     def take_screenshot(self, driver, url, post_id, comment_ids=None):
+        """Take screenshots of Reddit post and comments"""
         print(f"Taking screenshots for post: {post_id}")
-        
-        driver.get(url)
-        time.sleep(3)
         
         screenshots = {}
         
         try:
-            post_element = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='post-content']"))
-            )
+            driver.get(url)
+            time.sleep(5)  # Wait for page to load
             
-            post_filename = f"post_{post_id}.png"
-            post_path = os.path.join(self.screenshots_dir, post_filename)
-            post_element.screenshot(post_path)
-            screenshots['post'] = post_path
+            # Robust post screenshot
+            post_selectors = [
+                "[data-testid='post-content']", ".Post", "[data-click-id='text']", ".s1b7hvcc-0",
+                "div[data-test-id='post-content']", "article", "main", "body"
+            ]
             
+            post_element = None
+            for selector in post_selectors:
+                try:
+                    post_element = WebDriverWait(driver, 8).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    if post_element:
+                        break
+                except TimeoutException:
+                    continue
+            
+            if post_element:
+                post_filename = f"post_{post_id}.png"
+                post_path = os.path.join(self.screenshots_dir, post_filename)
+                try:
+                    post_element.screenshot(post_path)
+                    screenshots['post'] = post_path
+                    print(f"Post screenshot saved: {post_filename}")
+                except Exception as e:
+                    print(f"Element screenshot failed: {e}, trying full page.")
+            if 'post' not in screenshots:
+                # Fallback: full page screenshot
+                fallback_path = os.path.join(self.screenshots_dir, f"post_{post_id}_full.png")
+                driver.save_screenshot(fallback_path)
+                screenshots['post'] = fallback_path
+                print(f"Full page screenshot saved: post_{post_id}_full.png")
+            
+            # Robust comment screenshots
             if comment_ids:
+                # Wait for at least one comment to be present
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='comment']"))
+                )
+                all_comment_elements = driver.find_elements(By.CSS_SELECTOR, "[data-testid='comment']")
                 for i, comment_id in enumerate(comment_ids):
-                    try:
-                        comment_selector = f"[data-testid='comment']"
-                        comment_elements = driver.find_elements(By.CSS_SELECTOR, comment_selector)
-                        
-                        if i < len(comment_elements):
+                    found = False
+                    for elem in all_comment_elements:
+                        # Try to match by id or data-comment-id attribute
+                        elem_id = elem.get_attribute("id")
+                        data_comment_id = elem.get_attribute("data-comment-id")
+                        if (elem_id and elem_id.endswith(comment_id)) or (data_comment_id == comment_id):
                             comment_filename = f"comment_{comment_id}.png"
                             comment_path = os.path.join(self.screenshots_dir, comment_filename)
-                            comment_elements[i].screenshot(comment_path)
+                            elem.screenshot(comment_path)
                             screenshots[f'comment_{i}'] = comment_path
-                    
-                    except Exception as e:
-                        print(f"Error taking screenshot for comment {comment_id}: {e}")
+                            print(f"Comment screenshot saved: {comment_filename}")
+                            found = True
+                            break
+                    if not found:
+                        print(f"Could not find comment element for {comment_id}, falling back to first available comment block.")
+                        # Fallback: screenshot the i-th comment block if available
+                        if i < len(all_comment_elements):
+                            fallback_elem = all_comment_elements[i]
+                            comment_filename = f"comment_{comment_id}_fallback.png"
+                            comment_path = os.path.join(self.screenshots_dir, comment_filename)
+                            fallback_elem.screenshot(comment_path)
+                            screenshots[f'comment_{i}'] = comment_path
+                            print(f"Fallback comment screenshot saved: {comment_filename}")
+                        else:
+                            # Last resort: full page
+                            fallback_path = os.path.join(self.screenshots_dir, f"comment_{comment_id}_full.png")
+                            driver.save_screenshot(fallback_path)
+                            screenshots[f'comment_{i}'] = fallback_path
+                            print(f"Full page fallback for comment: {comment_id}")
         
         except Exception as e:
             print(f"Error taking screenshots: {e}")
@@ -330,158 +487,252 @@ Original Post: {post_data['title']}
         return screenshots
     
     def create_video(self, post_data, comments_data, screenshots, audio_files):
+        """Create video from screenshots and audio"""
         print("Creating video...")
         
         clips = []
         
-        if 'post' in screenshots and 'post' in audio_files:
-            post_audio = AudioFileClip(audio_files['post'])
-            post_img = ImageClip(screenshots['post']).set_duration(post_audio.duration)
-            post_clip = post_img.set_audio(post_audio)
-            clips.append(post_clip)
-        
-        for i, comment in enumerate(comments_data):
-            comment_key = f'comment_{i}'
-            if comment_key in screenshots and comment_key in audio_files:
-                comment_audio = AudioFileClip(audio_files[comment_key])
-                comment_img = ImageClip(screenshots[comment_key]).set_duration(comment_audio.duration)
-                comment_clip = comment_img.set_audio(comment_audio)
-                clips.append(comment_clip)
-        
-        if not clips:
-            print("No clips to process!")
-            return None
-        
-        main_video = concatenate_videoclips(clips, method="compose")
-        
-        background_files = [f for f in os.listdir(self.background_dir) if f.endswith('.mp4')]
-        
-        if background_files:
-            background_file = random.choice(background_files)
-            background_path = os.path.join(self.background_dir, background_file)
+        try:
+            # Add post clip
+            if 'post' in screenshots and 'post' in audio_files and audio_files['post']:
+                try:
+                    post_audio = AudioFileClip(audio_files['post'])
+                    post_img = ImageClip(screenshots['post']).set_duration(post_audio.duration)
+                    post_clip = post_img.set_audio(post_audio)
+                    clips.append(post_clip)
+                except Exception as e:
+                    print(f"Error creating post clip: {e}")
             
-            try:
-                background = VideoFileClip(background_path)
+            # Add comment clips
+            for i, comment in enumerate(comments_data):
+                comment_key = f'comment_{i}'
+                if comment_key in screenshots and comment_key in audio_files and audio_files[comment_key]:
+                    try:
+                        comment_audio = AudioFileClip(audio_files[comment_key])
+                        comment_img = ImageClip(screenshots[comment_key]).set_duration(comment_audio.duration)
+                        comment_clip = comment_img.set_audio(comment_audio)
+                        clips.append(comment_clip)
+                    except Exception as e:
+                        print(f"Error creating comment clip {i}: {e}")
+            
+            if not clips:
+                print("No clips to process!")
+                return None
+            
+            # Concatenate all clips
+            main_video = concatenate_videoclips(clips, method="compose")
+            
+            # Add background video if available
+            background_files = [f for f in os.listdir(self.background_dir) if f.endswith('.mp4')]
+            
+            if background_files:
+                background_file = random.choice(background_files)
+                background_path = os.path.join(self.background_dir, background_file)
                 
-                if background.duration < main_video.duration:
-                    background = background.loop(duration=main_video.duration)
-                else:
-                    background = background.subclip(0, main_video.duration)
-                
-                main_video_resized = main_video.resize(height=background.h//2).set_position(('center', 'center'))
-                
-                final_video = CompositeVideoClip([background, main_video_resized])
-                
-            except Exception as e:
-                print(f"Error adding background: {e}")
+                try:
+                    background = VideoFileClip(background_path)
+                    
+                    # Loop background if needed
+                    if background.duration < main_video.duration:
+                        background = background.loop(duration=main_video.duration)
+                    else:
+                        background = background.subclip(0, main_video.duration)
+                    
+                    # Resize main video and overlay on background
+                    main_video_resized = main_video.resize(height=background.h//2).set_position(('center', 'center'))
+                    final_video = CompositeVideoClip([background, main_video_resized])
+                    
+                    background.close()
+                    
+                except Exception as e:
+                    print(f"Error adding background: {e}")
+                    final_video = main_video
+            else:
+                print("No background videos found, using main video only")
                 final_video = main_video
-        else:
-            final_video = main_video
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"reddit_video_{post_data['id']}_{timestamp}.mp4"
-        output_path = os.path.join(self.videos_dir, output_filename)
-        
-        final_video.write_videofile(
-            output_path,
-            fps=24,
-            codec='libx264',
-            audio_codec='aac'
-        )
-        
-        for clip in clips:
-            clip.close()
-        if 'final_video' in locals():
+            
+            # Generate output filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = f"reddit_video_{post_data['id']}_{timestamp}.mp4"
+            output_path = os.path.join(self.videos_dir, output_filename)
+            
+            # Write video file
+            final_video.write_videofile(
+                output_path,
+                fps=24,
+                codec='libx264',
+                audio_codec='aac',
+                verbose=False,
+                logger=None
+            )
+            
+            # Clean up clips
+            for clip in clips:
+                clip.close()
+            main_video.close()
             final_video.close()
-        
-        print(f"Video saved: {output_path}")
-        return output_path
+            
+            print(f"Video saved: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            print(f"Error creating video: {e}")
+            return None
     
-    def generate_and_upload_video(self, subreddit="AskReddit"):
+    def cleanup_temp_files(self):
+        """Clean up temporary files"""
+        try:
+            # Clean up audio files
+            for file in os.listdir(self.audio_dir):
+                if file.endswith('.wav'):
+                    os.remove(os.path.join(self.audio_dir, file))
+            
+            # Clean up screenshot files
+            for file in os.listdir(self.screenshots_dir):
+                if file.endswith('.png'):
+                    os.remove(os.path.join(self.screenshots_dir, file))
+                    
+            print("Temporary files cleaned up")
+        except Exception as e:
+            print(f"Error cleaning up temporary files: {e}")
+    
+    def generate_and_upload_video(self, subreddit=None, auto_upload=None):
+        """Main method to generate and optionally upload video"""
         print("Starting video generation...")
         
-        submission = self.get_reddit_post(subreddit)
-        if not submission:
-            return None
+        if subreddit is None:
+            subreddit = random.choice(self.TOP_STORY_SUBREDDITS)
+        if auto_upload is None:
+            auto_upload = self.auto_upload
         
-        comments = self.get_comments(submission)
-        if not comments:
-            print("No suitable comments found!")
-            return None
-        
-        audio_files = {}
-        
-        post_text = f"{submission.title}. {submission.selftext}" if submission.selftext else submission.title
-        audio_files['post'] = self.text_to_speech(post_text, f"post_{submission.id}")
-        
-        for i, comment in enumerate(comments):
-            audio_files[f'comment_{i}'] = self.text_to_speech(
-                comment['body'], 
-                f"comment_{comment['id']}"
-            )
-        
-        driver = self.setup_browser()
         try:
-            comment_ids = [comment['id'] for comment in comments]
-            screenshots = self.take_screenshot(
-                driver, 
-                f"https://reddit.com{submission.permalink}", 
-                submission.id,
-                comment_ids
-            )
-        finally:
-            driver.quit()
-        
-        post_data = {
-            'id': submission.id,
-            'title': submission.title,
-            'text': submission.selftext,
-            'url': submission.permalink
-        }
-        
-        video_path = self.create_video(post_data, comments, screenshots, audio_files)
-        
-        if not video_path:
-            print("Failed to create video!")
+            # Get Reddit post
+            submission = self.get_reddit_post(subreddit)
+            if not submission:
+                return None
+            
+            # Get comments
+            comments = self.get_comments(submission)
+            if not comments:
+                print("No suitable comments found!")
+                return None
+            
+            # Generate audio files
+            audio_files = {}
+            
+            # Generate TTS for post
+            post_text = f"{submission.title}. {submission.selftext}" if submission.selftext else submission.title
+            audio_files['post'] = self.text_to_speech(post_text, f"post_{submission.id}")
+            
+            # Generate TTS for comments
+            for i, comment in enumerate(comments):
+                audio_file = self.text_to_speech(
+                    comment['body'], 
+                    f"comment_{comment['id']}"
+                )
+                if audio_file:
+                    audio_files[f'comment_{i}'] = audio_file
+            
+            # Take screenshots
+            driver = None
+            try:
+                driver = self.setup_browser()
+                comment_ids = [comment['id'] for comment in comments]
+                screenshots = self.take_screenshot(
+                    driver, 
+                    f"https://reddit.com{submission.permalink}", 
+                    submission.id,
+                    comment_ids
+                )
+            except Exception as e:
+                print(f"Error with browser operations: {e}")
+                screenshots = {}
+            finally:
+                if driver:
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+            
+            if not screenshots:
+                print("No screenshots were taken. Cannot create video.")
+                return None
+            
+            # Prepare post data
+            post_data = {
+                'id': submission.id,
+                'title': submission.title,
+                'text': submission.selftext,
+                'url': submission.permalink,
+                'subreddit': getattr(submission, 'subreddit_name', subreddit)
+            }
+            
+            # Create video
+            video_path = self.create_video(post_data, comments, screenshots, audio_files)
+            
+            if not video_path:
+                print("Failed to create video!")
+                return None
+            
+            result = {
+                'video_path': video_path,
+                'post_data': post_data,
+                'comments_data': comments
+            }
+            
+            print(f"✅ Video generation complete: {video_path}")
+            
+            # Ask user about YouTube upload
+            while True:
+                try:
+                    upload_choice = input("\nDo you want to upload this video to YouTube? (y/n): ").lower().strip()
+                    if upload_choice in ['y', 'yes']:
+                        youtube_result = self.upload_to_youtube(video_path, post_data, comments)
+                        if youtube_result:
+                            result.update(youtube_result)
+                        else:
+                            print("Failed to upload to YouTube, but video was created successfully.")
+                        break
+                    elif upload_choice in ['n', 'no']:
+                        print("Video saved locally. Skipping YouTube upload.")
+                        break
+                    else:
+                        print("Please enter 'y' for yes or 'n' for no.")
+                except KeyboardInterrupt:
+                    print("\nSkipping YouTube upload.")
+                    break
+            
+            # Mark post as processed
+            self.processed_posts.add(submission.id)
+            self.save_processed_posts()
+            
+            # Clean up temporary files
+            self.cleanup_temp_files()
+            
+            print(f"✅ Process complete!")
+            return result
+            
+        except Exception as e:
+            print(f"Error in video generation process: {e}")
             return None
-        
-        result = {
-            'video_path': video_path,
-            'post_data': post_data,
-            'comments_data': comments
-        }
-        
-        print(f"✅ Video generation complete: {video_path}")
-        
-        while True:
-            upload_choice = input("\nDo you want to upload this video to YouTube? (y/n): ").lower().strip()
-            if upload_choice in ['y', 'yes']:
-                youtube_result = self.upload_to_youtube(video_path, post_data, comments)
-                if youtube_result:
-                    result.update(youtube_result)
-                else:
-                    print("Failed to upload to YouTube, but video was created successfully.")
-                break
-            elif upload_choice in ['n', 'no']:
-                print("Video saved locally. Skipping YouTube upload.")
-                break
-            else:
-                print("Please enter 'y' for yes or 'n' for no.")
-        
-        self.processed_posts.add(submission.id)
-        self.save_processed_posts()
-        
-        print(f"✅ Process complete!")
-        return result
+
+def main():
+    """Main function"""
+    import argparse
+    parser = argparse.ArgumentParser(description="Reddit Story Video Generator")
+    parser.add_argument('--auto-upload', action='store_true', help='Automatically upload to YouTube without prompt')
+    args = parser.parse_args()
+    try:
+        generator = RedditVideoGenerator(auto_upload=args.auto_upload)
+        result = generator.generate_and_upload_video(auto_upload=args.auto_upload)
+        if result:
+            print(f"\nSuccess! Video saved at: {result['video_path']}")
+            if 'video_url' in result:
+                print(f"YouTube URL: {result['video_url']}")
+        else:
+            print("Failed to generate video")
+    except Exception as e:
+        print(f"Fatal error: {e}")
 
 if __name__ == "__main__":
-    generator = RedditVideoGenerator()
-    
-    result = generator.generate_and_upload_video("AskReddit")
-    
-    if result:
-        print(f"Success! Video saved at: {result['video_path']}")
-        if 'video_url' in result:
-            print(f"YouTube URL: {result['video_url']}")
-    else:
-        print("Failed to generate video")
+    main()
